@@ -1,0 +1,445 @@
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+import uvicorn
+import threading
+import time
+from datetime import datetime
+from defi_env import DeFiEnvironment
+from rl_agent import DeFiRLAgent
+from config import RL_CONFIG, ENV_CONFIG
+import numpy as np
+
+app = FastAPI(title="FT-3 DeFi RL API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+global_state = {
+    "is_training": False,
+    "env": None,
+    "agent": None,
+    "episode": 0,
+    "risk_appetite": 5,
+    "training_thread": None
+}
+
+
+@app.on_event("startup")
+async def startup():
+    try:
+        print("[STARTUP] Initializing environment and agent...")
+        global_state["env"] = DeFiEnvironment(ENV_CONFIG.get("initial_capital", 100000), risk_appetite=5)
+        global_state["agent"] = DeFiRLAgent()
+        print("[STARTUP] Initialization complete")
+    except Exception as e:
+        print(f"[STARTUP] Error during startup: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+@app.get("/")
+async def serve_dashboard():
+    return FileResponse("dashboard.html", media_type="text/html")
+
+
+@app.get("/dashboard.html")
+async def serve_dashboard_html():
+    return FileResponse("dashboard.html", media_type="text/html")
+
+
+@app.get("/api/status")
+async def get_status():
+    """Get current training status and portfolio metrics"""
+    env = global_state["env"]
+    agent = global_state["agent"]
+    is_training = global_state.get("is_training", False)
+
+    if not env or not agent:
+        return {
+            "portfolio_value": 100000,
+            "allocation": [0.2, 0.2, 0.2, 0.2, 0.2],
+            "roi": 0.0,
+            "risk_score": 50,
+            "sharpe_ratio": 0.0,
+            "episodes": 0,
+            "total_episodes": RL_CONFIG.get("episodes", 1000),
+            "avg_reward": 0.0,
+            "best_reward": 0.0,
+            "training": is_training,
+            "timestamp": datetime.now().isoformat()
+        }
+
+    try:
+        # Get portfolio value, allocation, and risk_score from history
+        if (hasattr(env, 'portfolio_calc') and
+                hasattr(env.portfolio_calc, 'history') and
+                len(env.portfolio_calc.history) > 0):
+
+            latest = env.portfolio_calc.history[-1]
+            current_value = latest.get("value", 100000)
+            allocation = latest.get("allocation", [0.2, 0.2, 0.2, 0.2, 0.2])
+            roi = latest.get("roi", 0.0)
+            risk_score = latest.get("risk", 50)  # ← GET RISK_SCORE FROM HISTORY!
+
+            print(f"[API-STATUS] From history - Value: {current_value:.2f}, Risk: {risk_score:.1f}, ROI: {roi:.4f}")
+        else:
+            current_value = 100000
+            allocation = [0.2, 0.2, 0.2, 0.2, 0.2]
+            roi = 0.0
+            risk_score = 50
+            print(f"[API-STATUS] No history, using defaults")
+
+        # Get initial capital
+        initial_capital = env.initial_capital if hasattr(env, 'initial_capital') else 100000
+
+        # Get rewards
+        avg_reward = 0.0
+        best_reward = 0.0
+        if hasattr(agent, 'episode_rewards') and agent.episode_rewards:
+            avg_reward = np.mean(agent.episode_rewards[-50:]) if len(agent.episode_rewards) > 0 else 0.0
+            best_reward = max(agent.episode_rewards) if len(agent.episode_rewards) > 0 else 0.0
+
+        # Validate allocation
+        allocation = np.array(allocation)
+        if np.isnan(allocation).any():
+            allocation = np.array([0.2, 0.2, 0.2, 0.2, 0.2])
+        allocation = np.clip(allocation, 0, 1)
+        if allocation.sum() > 0:
+            allocation = allocation / allocation.sum()
+        else:
+            allocation = np.array([0.2, 0.2, 0.2, 0.2, 0.2])
+
+        # Calculate Sharpe Ratio
+        sharpe_ratio = calculate_sharpe_ratio(env)
+
+        return {
+            "portfolio_value": float(current_value),
+            "allocation": [float(a) for a in allocation],
+            "roi": float(roi),
+            "risk_score": float(risk_score),  # ← FROM HISTORY!
+            "sharpe_ratio": float(sharpe_ratio),
+            "episodes": global_state.get("episode", 0),
+            "total_episodes": RL_CONFIG.get("episodes", 1000),
+            "avg_reward": float(avg_reward),
+            "best_reward": float(best_reward),
+            "training": is_training,
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except Exception as e:
+        print(f"[API-STATUS] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "portfolio_value": 100000,
+            "allocation": [0.2, 0.2, 0.2, 0.2, 0.2],
+            "roi": 0.0,
+            "risk_score": 50,
+            "sharpe_ratio": 0.0,
+            "episodes": 0,
+            "total_episodes": RL_CONFIG.get("episodes", 1000),
+            "avg_reward": 0.0,
+            "best_reward": 0.0,
+            "training": False,
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
+
+
+@app.get("/api/portfolio-history")
+async def get_portfolio_history():
+    """Get portfolio value history"""
+    env = global_state["env"]
+
+    if not env or not hasattr(env, 'portfolio_calc') or not env.portfolio_calc.history:
+        return {
+            "portfolio_history": [100000],
+            "length": 1
+        }
+
+    try:
+        portfolio_values = [h["value"] for h in env.portfolio_calc.history]
+        return {
+            "portfolio_history": portfolio_values,
+            "length": len(portfolio_values)
+        }
+    except Exception as e:
+        print(f"[API] Error in get_portfolio_history: {e}")
+        return {
+            "portfolio_history": [100000],
+            "length": 1
+        }
+
+
+@app.get("/api/allocations-history")
+async def get_allocations_history():
+    """Get allocation history"""
+    env = global_state["env"]
+
+    if not env or not hasattr(env, 'portfolio_calc') or not env.portfolio_calc.history:
+        return {
+            "allocations_history": [{
+                "staking": 0.2,
+                "yield_farming": 0.2,
+                "liquidity_pools": 0.2,
+                "lending": 0.2,
+                "cash": 0.2
+            }]
+        }
+
+    try:
+        history = []
+        for h in env.portfolio_calc.history:
+            alloc = h.get("allocation", [0.2, 0.2, 0.2, 0.2, 0.2])
+            history.append({
+                "staking": float(alloc[0]),
+                "yield_farming": float(alloc[1]),
+                "liquidity_pools": float(alloc[2]),
+                "lending": float(alloc[3]),
+                "cash": float(alloc[4])
+            })
+
+        return {"allocations_history": history}
+    except Exception as e:
+        print(f"[API] Error in get_allocations_history: {e}")
+        return {
+            "allocations_history": [{
+                "staking": 0.2,
+                "yield_farming": 0.2,
+                "liquidity_pools": 0.2,
+                "lending": 0.2,
+                "cash": 0.2
+            }]
+        }
+
+
+@app.post("/api/start-training")
+async def start_training(request: Request):
+    """Start training with specified parameters"""
+    print("\n" + "=" * 80)
+    print("[API] /start-training called")
+    print("=" * 80)
+
+    if global_state["is_training"]:
+        print("[API] Training already in progress")
+        return {"message": "Training already in progress"}
+
+    try:
+        # Get input data from frontend
+        data = await request.json()
+        initial_capital = float(data.get("initial_capital", 100000))
+        risk_appetite = float(data.get("risk_appetite", 5))
+
+        print(f"[API] Received: Capital=${initial_capital}, Risk Appetite={risk_appetite}")
+
+        # Reinitialize environment with BOTH capital AND risk_appetite
+        print("[API] Creating new environment...")
+        global_state["env"] = DeFiEnvironment(initial_capital, risk_appetite=risk_appetite)
+        print(f"[API] Environment created with Risk Appetite: {risk_appetite}")
+
+        print("[API] Creating new agent...")
+        global_state["agent"] = DeFiRLAgent()
+
+        global_state["is_training"] = True
+        global_state["episode"] = 0
+        global_state["risk_appetite"] = risk_appetite
+
+        print("[API] Starting training thread...")
+        thread = threading.Thread(target=train_loop, daemon=True)
+        global_state["training_thread"] = thread
+        thread.start()
+        print("[API] Training thread started successfully")
+
+        print("=" * 80 + "\n")
+
+        return {
+            "message": "Training started",
+            "initial_capital": initial_capital,
+            "risk_appetite": risk_appetite
+        }
+    except Exception as e:
+        print(f"[API] Error in start_training: {e}")
+        import traceback
+        traceback.print_exc()
+        global_state["is_training"] = False
+        return {
+            "message": "Error starting training",
+            "error": str(e)
+        }
+
+
+@app.post("/api/stop-training")
+async def stop_training():
+    """Stop training"""
+    print("[API] /stop-training called")
+    global_state["is_training"] = False
+    return {"message": "Training stopped"}
+
+
+@app.get("/api/market-data")
+async def get_market_data():
+    """Get current real-time market data"""
+    try:
+        try:
+            from market_data import market_data_fetcher
+            data = await market_data_fetcher.get_all_defi_rates()
+            tvl_data = await market_data_fetcher.get_defi_tvl()
+            volatility = await market_data_fetcher.get_market_volatility()
+
+            return {
+                "rates": data,
+                "tvl": tvl_data,
+                "volatility": volatility,
+                "timestamp": datetime.now().isoformat()
+            }
+        except ImportError:
+            return {
+                "rates": {
+                    "staking_apy": 0.04,
+                    "yield_farming_apy": 0.08,
+                    "liquidity_pool_apy": 0.10,
+                    "lending_apy": 0.035,
+                    "eth_price": 3000,
+                    "btc_price": 60000,
+                    "timestamp": datetime.now().isoformat()
+                },
+                "tvl": {"total_tvl": 0, "protocols": []},
+                "volatility": 0.15,
+                "timestamp": datetime.now().isoformat()
+            }
+    except Exception as e:
+        print(f"[API] Error in get_market_ {e}")
+        return {"error": str(e), "timestamp": datetime.now().isoformat()}
+
+
+def calculate_sharpe_ratio(env):
+    """Calculate Sharpe Ratio with robust error handling"""
+    try:
+        if not hasattr(env, 'portfolio_calc') or not hasattr(env.portfolio_calc, 'history'):
+            return 0.0
+
+        history = env.portfolio_calc.history
+
+        if len(history) < 2:
+            return 0.0
+
+        values = []
+        for h in history:
+            if isinstance(h, dict) and "value" in h:
+                val = h["value"]
+                if isinstance(val, (int, float)) and not np.isnan(val) and not np.isinf(val):
+                    values.append(float(val))
+
+        if len(values) < 2:
+            return 0.0
+
+        values = np.array(values)
+        returns = np.diff(values) / values[:-1]
+        returns = returns[~np.isnan(returns)]
+        returns = returns[~np.isinf(returns)]
+
+        if len(returns) == 0:
+            return 0.0
+
+        avg_return = np.mean(returns)
+        std_return = np.std(returns)
+        risk_free_rate = 0.02 / 252
+
+        if std_return == 0 or np.isnan(std_return) or np.isinf(std_return):
+            return 0.0
+
+        sharpe_ratio = (avg_return - risk_free_rate) / std_return
+        sharpe_ratio_annualized = sharpe_ratio * np.sqrt(252)
+
+        if np.isnan(sharpe_ratio_annualized) or np.isinf(sharpe_ratio_annualized):
+            return 0.0
+
+        return float(sharpe_ratio_annualized)
+
+    except Exception as e:
+        print(f"[SHARPE] Error: {e}")
+        return 0.0
+
+
+def train_loop():
+    """Main training loop"""
+    print("\n" + "=" * 80)
+    print("[TRAIN] ========== TRAINING LOOP STARTED ==========")
+    print("=" * 80 + "\n")
+
+    env = global_state["env"]
+    agent = global_state["agent"]
+
+    try:
+        total_episodes = RL_CONFIG.get("episodes", 1000)
+
+        for episode in range(total_episodes):
+            if not global_state["is_training"]:
+                print(f"[TRAIN] Training stopped at episode {episode}")
+                break
+
+            print(f"\n{'=' * 80}")
+            print(f"[TRAIN] EPISODE {episode + 1} / {total_episodes}")
+            print(f"{'=' * 80}")
+
+            try:
+                state = env.reset()
+                print(f"[TRAIN] Environment reset")
+                total_reward = 0
+
+                for step in range(RL_CONFIG.get("max_steps_per_episode", 100)):
+                    try:
+                        action, policy, value = agent.predict_action(state)
+                        next_state, reward, done, info = env.step(action)
+                        state = next_state
+                        total_reward += reward
+
+                        if done:
+                            break
+                    except Exception as e:
+                        print(f"[TRAIN-STEP] ERROR at step {step}: {e}")
+                        break
+
+                if not hasattr(agent, 'episode_rewards'):
+                    agent.episode_rewards = []
+                agent.episode_rewards.append(total_reward)
+
+                global_state["episode"] = episode + 1
+
+                if hasattr(env, 'portfolio_calc'):
+                    history_len = len(env.portfolio_calc.history)
+                    print(f"[TRAIN] Episode {episode + 1}: Reward={total_reward:.4f}, History={history_len}")
+                    if history_len > 0:
+                        latest = env.portfolio_calc.history[-1]
+                        print(
+                            f"[TRAIN] Portfolio: Value=${latest.get('value', 0):.2f}, Risk={latest.get('risk', 50):.1f}")
+
+                if episode % 50 == 0 and len(agent.episode_rewards) >= 50:
+                    avg_rewards_50 = np.mean(agent.episode_rewards[-50:])
+                    print(f"\n[CHECKPOINT] Episode {episode}, Avg Reward (50): {avg_rewards_50:.4f}\n")
+
+            except Exception as e:
+                print(f"[TRAIN] ERROR in episode {episode}: {e}")
+                import traceback
+                traceback.print_exc()
+
+    except Exception as e:
+        print(f"[TRAIN] CRITICAL ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+
+    finally:
+        global_state["is_training"] = False
+        print("\n" + "=" * 80)
+        print("[TRAIN] ========== TRAINING LOOP COMPLETED ==========")
+        print("=" * 80 + "\n")
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
